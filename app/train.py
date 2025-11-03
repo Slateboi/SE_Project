@@ -1,6 +1,5 @@
-# app/train.py
 """
-Train a CNN on the preprocessed dataset.
+Train a CNN (MobileNetV2 transfer learning) on the preprocessed ASL dataset.
 
 Usage:
   conda activate gesture
@@ -10,9 +9,9 @@ Usage:
 import json
 import os
 import numpy as np
-from tensorflow.keras.models import Sequential
-from tensorflow.keras.layers import (Conv2D, MaxPooling2D, Flatten, Dense,
-                                     Dropout, BatchNormalization)
+from tensorflow.keras.models import Model
+from tensorflow.keras.layers import GlobalAveragePooling2D, Dense, Dropout
+from tensorflow.keras.applications import MobileNetV2
 from tensorflow.keras.optimizers import Adam
 from tensorflow.keras.callbacks import ModelCheckpoint, EarlyStopping, ReduceLROnPlateau
 from tensorflow.keras.utils import to_categorical
@@ -23,11 +22,11 @@ DATA_DIR = "dataset"
 MODEL_OUT = "app/gesture_model.h5"
 LABEL_MAP_OUT = "app/label_map.json"
 
-IMG_H, IMG_W = 64, 64        # must match preprocess resize
+IMG_H, IMG_W = 64, 64
 BATCH = 64
-EPOCHS = 25
-LR = 1e-3
-AUGMENT = True               # set False to disable data augmentation
+EPOCHS = 15           # can increase to 25+ later
+LR = 1e-4
+AUGMENT = True
 # ----------------------------------------
 
 # ---------------- helper ----------------
@@ -37,46 +36,43 @@ def load_data():
     y_train = np.load(os.path.join(DATA_DIR, "y_train.npy"))
     y_test  = np.load(os.path.join(DATA_DIR, "y_test.npy"))
     label_map = np.load(os.path.join(DATA_DIR, "label_dict.npy"), allow_pickle=True).item()
-    # ensure shapes & types
+
     X_train = X_train.astype("float32")
     X_test  = X_test.astype("float32")
     return X_train, X_test, y_train, y_test, label_map
 
 def get_model(input_shape, num_classes):
-    model = Sequential([
-        Conv2D(32, (3,3), activation="relu", padding="same", input_shape=input_shape),
-        BatchNormalization(),
-        MaxPooling2D(2,2),
+    base = MobileNetV2(include_top=False, weights="imagenet", input_shape=input_shape)
+    base.trainable = False  # freeze pretrained layers for faster training
 
-        Conv2D(64, (3,3), activation="relu", padding="same"),
-        BatchNormalization(),
-        MaxPooling2D(2,2),
+    x = base.output
+    x = GlobalAveragePooling2D()(x)
+    x = Dense(256, activation="relu")(x)
+    x = Dropout(0.5)(x)
+    outputs = Dense(num_classes, activation="softmax")(x)
 
-        Conv2D(128, (3,3), activation="relu", padding="same"),
-        BatchNormalization(),
-        MaxPooling2D(2,2),
-
-        Flatten(),
-        Dense(256, activation="relu"),
-        Dropout(0.5),
-        Dense(num_classes, activation="softmax")
-    ])
+    model = Model(inputs=base.input, outputs=outputs)
     return model
 
 # ---------------- training ----------------
 def main():
-    print("Loading data...")
+    print("📦 Loading data...")
     X_train, X_test, y_train, y_test, label_map = load_data()
     num_classes = len(label_map)
-    print(f"Shapes: X_train={X_train.shape}, X_test={X_test.shape}")
-    print("Num classes:", num_classes)
+    print(f"✅ Data shapes: X_train={X_train.shape}, X_test={X_test.shape}")
+    print("🧩 Classes:", num_classes)
 
-    # Convert labels to categorical
+    # Convert grayscale → 3-channel RGB (MobileNetV2 expects 3 channels)
+    if X_train.shape[-1] == 1:
+        X_train = np.repeat(X_train, 3, axis=-1)
+        X_test  = np.repeat(X_test, 3, axis=-1)
+
+    # Convert labels to one-hot
     y_train_cat = to_categorical(y_train, num_classes)
     y_test_cat  = to_categorical(y_test, num_classes)
 
-    inp_shape = X_train.shape[1:]  # (H, W, C)
-    model = get_model(inp_shape, num_classes)
+    # Model setup
+    model = get_model(X_train.shape[1:], num_classes)
     model.compile(optimizer=Adam(learning_rate=LR),
                   loss="categorical_crossentropy",
                   metrics=["accuracy"])
@@ -84,7 +80,7 @@ def main():
 
     # Callbacks
     ckpt_cb = ModelCheckpoint(MODEL_OUT, monitor="val_accuracy", save_best_only=True, verbose=1)
-    es_cb = EarlyStopping(monitor="val_accuracy", patience=6, restore_best_weights=True, verbose=1)
+    es_cb = EarlyStopping(monitor="val_accuracy", patience=5, restore_best_weights=True, verbose=1)
     rl_cb = ReduceLROnPlateau(monitor="val_loss", factor=0.5, patience=3, verbose=1)
 
     # Data augmentation
@@ -104,7 +100,8 @@ def main():
             steps_per_epoch=steps_per_epoch,
             epochs=EPOCHS,
             validation_data=(X_test, y_test_cat),
-            callbacks=[ckpt_cb, es_cb, rl_cb]
+            callbacks=[ckpt_cb, es_cb, rl_cb],
+            verbose=1
         )
     else:
         history = model.fit(
@@ -112,20 +109,19 @@ def main():
             batch_size=BATCH,
             epochs=EPOCHS,
             validation_data=(X_test, y_test_cat),
-            callbacks=[ckpt_cb, es_cb, rl_cb]
+            callbacks=[ckpt_cb, es_cb, rl_cb],
+            verbose=1
         )
 
-    # Save final model (best already saved by checkpoint)
+    # Save model & label map
     if not os.path.exists(MODEL_OUT):
         model.save(MODEL_OUT)
-    print("Model training completed. Model saved to:", MODEL_OUT)
+    print("✅ Model training complete! Saved to:", MODEL_OUT)
 
-    # Save label map (index -> label) for inference
-    # label_map currently maps folder_name->index; we'll invert to idx->folder
     inv_label_map = {str(idx): label for label, idx in label_map.items()}
     with open(LABEL_MAP_OUT, "w") as f:
         json.dump(inv_label_map, f, indent=2)
-    print("Saved label map to:", LABEL_MAP_OUT)
+    print("📁 Saved label map to:", LABEL_MAP_OUT)
 
 if __name__ == "__main__":
     main()

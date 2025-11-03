@@ -1,0 +1,4 @@
+# Ignore large model & dataset files
+*.h5
+*.npy
+dataset/asl_alphabet/
