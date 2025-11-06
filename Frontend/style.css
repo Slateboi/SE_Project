@@ -1,0 +1,131 @@
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&display=swap');
+
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+body {
+  font-family: 'Inter', sans-serif;
+  background: linear-gradient(135deg, #0f0f0f, #1a1a1a);
+  color: #e6e6e6;
+  height: 100vh;
+  display: flex;
+  justify-content: center;
+  align-items: center;
+}
+
+.wrapper {
+  width: 90%;
+  max-width: 1000px;
+  background: rgba(25, 25, 25, 0.85);
+  border-radius: 18px;
+  padding: 40px;
+  box-shadow: 0 20px 40px rgba(0,0,0,0.5);
+  backdrop-filter: blur(12px);
+  transition: transform 0.3s ease;
+}
+
+.wrapper:hover {
+  transform: scale(1.01);
+}
+
+header {
+  text-align: center;
+  margin-bottom: 40px;
+}
+
+.animated-title {
+  font-size: 2.3rem;
+  font-weight: 600;
+  letter-spacing: 1px;
+  background: linear-gradient(270deg, #4facfe, #00f2fe, #4facfe);
+  background-size: 300% 300%;
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  animation: gradientFlow 6s ease infinite;
+  text-shadow: 0 0 10px rgba(79, 172, 254, 0.2);
+}
+
+@keyframes gradientFlow {
+  0% { background-position: 0% 50%; }
+  50% { background-position: 100% 50%; }
+  100% { background-position: 0% 50%; }
+}
+
+header p {
+  color: #aaa;
+  margin-top: 10px;
+  font-size: 0.95rem;
+}
+
+.main-container {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 40px;
+  flex-wrap: wrap;
+}
+
+.video-section, .output-section {
+  flex: 1;
+  min-width: 320px;
+}
+
+.video-section video {
+  width: 100%;
+  height: auto;
+  border-radius: 14px;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  box-shadow: 0 5px 20px rgba(0,0,0,0.4);
+}
+
+.output-section {
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 14px;
+  padding: 20px 25px;
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
+}
+
+.output-section h2 {
+  color: #aaa;
+  font-size: 1rem;
+  margin-bottom: 15px;
+}
+
+#output {
+  font-size: 1.3rem;
+  line-height: 1.6;
+  min-height: 90px;
+  letter-spacing: 0.5px;
+  background: linear-gradient(90deg, #6dd5ed, #2193b0);
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+}
+
+footer {
+  margin-top: 40px;
+  text-align: center;
+}
+
+button {
+  background: linear-gradient(135deg, #2b5876, #4e4376);
+  color: #fff;
+  border: none;
+  border-radius: 30px;
+  padding: 14px 40px;
+  font-size: 1rem;
+  cursor: pointer;
+  font-weight: 500;
+  letter-spacing: 0.5px;
+  transition: transform 0.25s ease, background 0.3s ease;
+}
+
+button:hover {
+  background: linear-gradient(135deg, #4e4376, #2b5876);
+  transform: translateY(-2px);
+}
