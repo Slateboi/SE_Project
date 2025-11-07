@@ -25,8 +25,8 @@ import tensorflow as tf
 from pathlib import Path
 import asyncio
 from collections import deque
-from fastapi.middleware.cors import CORSMiddleware
-
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse
 
 
 # ============= Configuration =============
@@ -37,8 +37,11 @@ ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24  # 24 hours
 MODEL_PATH = "../app/gesture_model.h5"
 LABEL_MAP_PATH = "../app/label_map.json"
 IMG_SIZE = (64, 64)
-ROI = (200, 80, 520, 400)
-CONF_THRESHOLD = 0.75
+# ROI coordinates - will be adjusted based on actual video dimensions
+# Format: (x1, y1, x2, y2) - top-left and bottom-right corners
+# These are relative percentages that will be scaled to actual video size
+ROI = None  # Will be calculated dynamically based on video dimensions
+CONF_THRESHOLD = 0.5  # Lowered to detect more letters (was 0.75)
 STABLE_FRAMES = 5
 TEXT_COOLDOWN = 1.2
 
@@ -82,6 +85,14 @@ app = FastAPI(
     description="Real-time American Sign Language fingerspelling recognition",
     version="1.0.0"
 )
+
+# Serve frontend
+from pathlib import Path
+frontend_path = Path(__file__).parent.parent / "frontend"
+
+@app.get("/")
+async def serve_frontend():
+    return FileResponse(frontend_path / "index.html")
 
 app.add_middleware(
     CORSMiddleware,
@@ -199,24 +210,107 @@ class ASLRecognizer:
     
     def predict(self, frame, roi=ROI):
         """Predict ASL letter from frame"""
-        x1, y1, x2, y2 = roi
+        # Get frame dimensions
+        h, w = frame.shape[:2]
+        
+        # If ROI is provided, use it; otherwise calculate a centered ROI
+        if roi:
+            x1, y1, x2, y2 = roi
+        else:
+            # Default: center region (30% margin on all sides)
+            margin_w = int(w * 0.3)
+            margin_h = int(h * 0.3)
+            x1, y1 = margin_w, margin_h
+            x2, y2 = w - margin_w, h - margin_h
+        
+        # Validate and clamp ROI to frame bounds
+        x1, y1 = max(0, x1), max(0, y1)
+        x2, y2 = min(w, x2), min(h, y2)
+        
+        # Check if ROI is valid
+        if x2 <= x1 or y2 <= y1:
+            print(f"⚠️ Invalid ROI: ({x1}, {y1}, {x2}, {y2}) for frame {w}x{h}")
+            return "nothing", 0.0
+        
+        # Note: Frontend video is mirrored for display, but canvas sends original frame
+        # So ROI coordinates should match the original (non-mirrored) frame
+        
         roi_crop = frame[y1:y2, x1:x2]
+        
+        if roi_crop.size == 0:
+            print(f"⚠️ Empty ROI crop from ({x1}, {y1}, {x2}, {y2})")
+            return "nothing", 0.0
+        
         roi_resized = cv2.resize(roi_crop, IMG_SIZE)
         
-        if self.expected_channels == 1:
-            proc = cv2.cvtColor(roi_resized, cv2.COLOR_BGR2GRAY)
-            proc = proc.reshape(IMG_SIZE[1], IMG_SIZE[0], 1)
+        # Convert to grayscale (model expects 1 channel, not 3)
+        if len(roi_resized.shape) == 3:
+            gray = cv2.cvtColor(roi_resized, cv2.COLOR_BGR2GRAY)
         else:
-            proc = cv2.cvtColor(roi_resized, cv2.COLOR_BGR2RGB)
-            proc = proc.reshape(IMG_SIZE[1], IMG_SIZE[0], 3)
+            gray = roi_resized
         
-        proc = proc.astype("float32") / 255.0
+        # Normalize to [0, 1] range (matching training)
+        proc = gray.astype("float32") / 255.0
+        
+        # Reshape to (64, 64, 1) - model expects 1 channel
+        proc = proc.reshape(IMG_SIZE[1], IMG_SIZE[0], 1)
+        
         input_tensor = np.expand_dims(proc, axis=0)
         
+        # Get model predictions
         preds = self.model.predict(input_tensor, verbose=0)[0]
-        class_idx = int(np.argmax(preds))
-        conf = float(preds[class_idx])
+        
+        # Use temperature scaling to reduce overconfidence
+        # This helps when model is overconfident (like 100% confidence)
+        # Temperature scaling: divide logits by temperature, then softmax
+        temperature = 3.0  # Higher temperature = softer predictions (reduces overconfidence more)
+        
+        # Apply temperature scaling (preds are already softmax outputs, so we need to convert back to logits)
+        # Since preds are probabilities, we convert to logits: log(p) / temperature
+        epsilon = 1e-10  # Avoid log(0)
+        logits = np.log(preds + epsilon) / temperature
+        preds_scaled = np.exp(logits - np.max(logits))  # Numerical stability
+        preds_scaled = preds_scaled / np.sum(preds_scaled)  # Renormalize to probabilities
+        
+        # SPECIAL HANDLING: If B has very high original confidence, penalize it
+        b_idx = None
+        for idx, lbl in self.idx_to_label.items():
+            if lbl == "B":
+                b_idx = idx
+                break
+        
+        if b_idx is not None and preds[b_idx] > 0.8:
+            # Penalize B predictions by reducing their confidence
+            preds_scaled[b_idx] = preds_scaled[b_idx] * 0.5  # Reduce B confidence by 50%
+            # Renormalize
+            preds_scaled = preds_scaled / np.sum(preds_scaled)
+        
+        class_idx = int(np.argmax(preds_scaled))
+        conf = float(preds_scaled[class_idx])
         label = self.idx_to_label.get(class_idx, str(class_idx))
+        
+        # Also get original confidence for comparison
+        original_conf = float(preds[class_idx])
+        
+        # Debug: Print top 3 predictions occasionally (every 30 frames to avoid spam)
+        if not hasattr(self, '_debug_counter'):
+            self._debug_counter = 0
+        self._debug_counter += 1
+        
+        if self._debug_counter % 30 == 0:  # Print every 30 predictions
+            top_3_indices = np.argsort(preds_scaled)[-3:][::-1]
+            top_3_labels = [self.idx_to_label.get(int(idx), str(idx)) for idx in top_3_indices]
+            top_3_confs = [float(preds_scaled[int(idx)]) for idx in top_3_indices]
+            print(f"🔍 Top 3 (scaled): {list(zip(top_3_labels, [f'{c:.2f}' for c in top_3_confs]))} | Selected: {label} (scaled={conf:.2f}, orig={original_conf:.2f})")
+        
+        # Check if prediction is suspiciously confident (might indicate model bias)
+        if original_conf > 0.95:
+            # Get all predictions to see distribution
+            all_preds = [(self.idx_to_label.get(int(i), str(i)), float(preds[i])) for i in range(len(preds))]
+            all_preds.sort(key=lambda x: x[1], reverse=True)
+            top_5 = all_preds[:5]
+            if self._debug_counter % 10 == 0:  # Print more frequently for high confidence
+                print(f"⚠️ High orig conf ({original_conf:.3f}) for '{label}'. Top 5: {top_5}")
         
         return label, conf
 
@@ -233,6 +327,10 @@ class RecognitionSession:
         self.last_frame_label = None
         self.last_accepted_label = None
         self.last_accept_time = 0
+        self.pending_letter = None  # Store pending letter waiting for confirmation
+        self.pending_confidence = 0.0
+        self.prediction_history = []  # Track recent predictions to detect stuck model
+        self.max_history = 50  # Keep last 50 predictions
 
 active_sessions: Dict[str, RecognitionSession] = {}
 
@@ -414,11 +512,114 @@ async def websocket_recognition(websocket: WebSocket):
                 if frame is None:
                     continue
                 
-                # Predict
-                label, conf = recognizer.predict(frame)
+                # Calculate dynamic ROI based on frame size
+                h, w = frame.shape[:2]
+                
+                # ROI: Left-center region (where hand typically appears)
+                # Frontend shows mirrored video, but backend gets original frame
+                # So left side of original = right side of mirrored display
+                margin_w = int(w * 0.25)  # 25% margin
+                margin_h = int(h * 0.2)   # 20% margin top/bottom
+                
+                # Use left-center region (this appears as right-center in mirrored view)
+                # This avoids capturing the face which is typically center-right
+                roi_x1 = margin_w
+                roi_y1 = margin_h
+                roi_x2 = int(w * 0.65)  # End at 65% of width (left-center region)
+                roi_y2 = h - margin_h
+                
+                # Validate ROI crop before prediction
+                roi_crop = frame[roi_y1:roi_y2, roi_x1:roi_x2]
+                
+                # Check if ROI is valid (not empty, has sufficient variance)
+                if roi_crop.size == 0:
+                    continue
+                
+                # Calculate image statistics to detect if it's too dark/empty
+                gray_roi = cv2.cvtColor(roi_crop, cv2.COLOR_BGR2GRAY) if len(roi_crop.shape) == 3 else roi_crop
+                mean_brightness = np.mean(gray_roi)
+                std_brightness = np.std(gray_roi)
+                
+                # Only skip if image is VERY dark (< 15) or has VERY little variance (< 5)
+                # This filters out completely black screens, covered cameras, etc.
+                # But allows normal hand signs which might be in shadow
+                if mean_brightness < 15 or std_brightness < 5:
+                    if hasattr(recognizer, '_skip_counter'):
+                        recognizer._skip_counter += 1
+                    else:
+                        recognizer._skip_counter = 1
+                    
+                    # Only print every 30 skips to avoid spam
+                    if recognizer._skip_counter % 30 == 0:
+                        print(f"⚠️ Skipping: ROI too dark/low variance (mean={mean_brightness:.1f}, std={std_brightness:.1f})")
+                    continue
+                
+                # Predict with dynamic ROI
+                label, conf = recognizer.predict(frame, roi=(roi_x1, roi_y1, roi_x2, roi_y2))
+                
+                # Track prediction history to detect if model is stuck on one letter
+                session_state.prediction_history.append((label, conf))
+                if len(session_state.prediction_history) > session_state.max_history:
+                    session_state.prediction_history.pop(0)
+                
+                # Check if model is stuck predicting the same letter (especially B)
+                if len(session_state.prediction_history) >= 10:
+                    recent_labels = [p[0] for p in session_state.prediction_history[-10:]]
+                    most_common = max(set(recent_labels), key=recent_labels.count)
+                    count_most_common = recent_labels.count(most_common)
+                    
+                    # If B appears in 70%+ of recent predictions, block ALL B predictions
+                    if count_most_common >= 7 and most_common == "B":
+                        recent_confs = [p[1] for p in session_state.prediction_history[-10:] if p[0] == "B"]
+                        avg_conf = np.mean(recent_confs) if recent_confs else 0
+                        if avg_conf > 0.85:
+                            print(f"🚫 Model stuck on 'B' ({count_most_common}/10 frames, avg conf={avg_conf:.2f}) - blocking all B predictions")
+                            # Block this prediction if it's B
+                            if label == "B":
+                                continue
+                
+                # Additional validation: if confidence is suspiciously high, require more stability
+                # But don't block completely - just require more frames
+                if conf >= 0.99:
+                    # Very high confidence - require more stability but still allow it
+                    required_stable_frames = STABLE_FRAMES * 3  # 15 frames instead of 5
+                    if not hasattr(recognizer, '_high_conf_counter'):
+                        recognizer._high_conf_counter = 0
+                    recognizer._high_conf_counter += 1
+                    if recognizer._high_conf_counter % 10 == 0:
+                        print(f"⚠️ Very high confidence ({conf:.3f}) for '{label}' - requiring extra stability (15 frames)")
+                else:
+                    required_stable_frames = STABLE_FRAMES * 2 if conf > 0.95 else STABLE_FRAMES
+                
+                # Filter out "nothing" predictions
+                if label.lower() == "nothing":
+                    continue
+                
+                # AGGRESSIVE FILTER: Block B predictions if model appears stuck
+                # If B is being predicted too frequently, it's likely a model bias issue
+                if label == "B":
+                    # Check recent history for B predictions
+                    recent_b_count = sum(1 for p in session_state.prediction_history[-10:] if p[0] == "B")
+                    
+                    # If B appears in 70%+ of recent predictions, block it
+                    if recent_b_count >= 7:
+                        print(f"🚫 Blocking B prediction - appears in {recent_b_count}/10 recent predictions (model stuck)")
+                        continue
+                    
+                    # If B has very high confidence (>0.9), require even more stability
+                    if conf > 0.9:
+                        required_stable_frames = max(required_stable_frames, STABLE_FRAMES * 4)  # 20 frames
+                        print(f"🔍 B detected with {conf:.3f} confidence - requiring {required_stable_frames} stable frames")
+                    
+                    # If B has extremely high confidence (>0.95), block it entirely
+                    if conf > 0.95:
+                        print(f"🚫 Blocking B prediction with suspiciously high confidence ({conf:.3f})")
+                        continue
                 
                 # Temporal smoothing
                 now = datetime.utcnow().timestamp()
+                
+                # required_stable_frames is set above based on confidence level
                 
                 if conf >= CONF_THRESHOLD:
                     if label == session_state.last_frame_label:
@@ -435,26 +636,50 @@ async def websocket_recognition(websocket: WebSocket):
                     "type": "prediction",
                     "label": label,
                     "confidence": conf,
-                    "stable": session_state.frame_count_same >= STABLE_FRAMES
+                    "stable": session_state.frame_count_same >= required_stable_frames
                 })
                 
-                # Accept stable prediction
-                if session_state.frame_count_same >= STABLE_FRAMES:
+                # When stable prediction is detected, send it as pending (waiting for confirmation)
+                if session_state.frame_count_same >= required_stable_frames:
                     if (label != session_state.last_accepted_label) or \
                        (now - session_state.last_accept_time > TEXT_COOLDOWN):
                         
-                        if label.lower() == "space":
-                            session_state.sentence += " "
-                            final_letter = "SPACE"
-                        elif label.lower() in ["del", "delete"]:
-                            if session_state.sentence:
-                                session_state.sentence = session_state.sentence[:-1]
-                            final_letter = "DELETE"
-                        elif label.lower() == "nothing":
+                        # Don't auto-add, instead send as pending for user confirmation
+                        if label.lower() == "nothing":
                             continue
-                        else:
-                            session_state.sentence += label
-                            final_letter = label
+                        
+                        # Store as pending letter
+                        session_state.pending_letter = label
+                        session_state.pending_confidence = conf
+                        
+                        # Send pending letter notification (waiting for user confirmation)
+                        await websocket.send_json({
+                            "type": "letter_pending",
+                            "letter": label,
+                            "confidence": conf,
+                            "message": "Letter detected - waiting for confirmation"
+                        })
+                        
+                        # Reset frame count to avoid spamming
+                        session_state.frame_count_same = 0
+                        session_state.last_frame_label = None
+            
+            elif data.get("type") == "accept_letter":
+                # User confirmed they want to add the pending letter
+                if session_state.pending_letter:
+                    label = session_state.pending_letter
+                    conf = session_state.pending_confidence
+                        
+                    if label.lower() == "space":
+                        session_state.sentence += " "
+                        final_letter = "SPACE"
+                    elif label.lower() in ["del", "delete"]:
+                        if session_state.sentence:
+                            session_state.sentence = session_state.sentence[:-1]
+                        final_letter = "DELETE"
+                    else:
+                        session_state.sentence += label
+                        final_letter = label
                         
                         # Save detection
                         detection = DBDetection(
@@ -470,19 +695,28 @@ async def websocket_recognition(websocket: WebSocket):
                         ).first()
                         db_session.total_letters += 1
                         db_session.full_text = session_state.sentence
-                        
                         db.commit()
                         
                         session_state.last_accepted_label = label
-                        session_state.last_accept_time = now
-                        session_state.frame_count_same = 0
+                    session_state.last_accept_time = datetime.utcnow().timestamp()
+                    session_state.pending_letter = None
+                    session_state.pending_confidence = 0.0
                         
-                        await websocket.send_json({
-                            "type": "letter_detected",
-                            "letter": final_letter,
-                            "confidence": conf,
-                            "sentence": session_state.sentence,
-                            "word_count": len(session_state.registered_words)
+                    await websocket.send_json({
+                        "type": "letter_detected",
+                        "letter": final_letter,
+                        "confidence": conf,
+                        "sentence": session_state.sentence,
+                        "word_count": len(session_state.registered_words)
+                    })
+            
+            elif data.get("type") == "reject_letter":
+                # User rejected the pending letter - just clear it
+                session_state.pending_letter = None
+                session_state.pending_confidence = 0.0
+                await websocket.send_json({
+                    "type": "letter_rejected",
+                    "message": "Letter rejected"
                         })
             
             elif data.get("type") == "register_word":
@@ -499,6 +733,8 @@ async def websocket_recognition(websocket: WebSocket):
             elif data.get("type") == "clear":
                 session_state.sentence = ""
                 session_state.registered_words = []
+                session_state.pending_letter = None
+                session_state.pending_confidence = 0.0
                 
                 await websocket.send_json({
                     "type": "cleared",

@@ -19,6 +19,35 @@
         #video {
             transform: scaleX(-1);
         }
+        #camera-inactive-overlay {
+            transition: opacity 0.3s ease;
+        }
+        /* NUCLEAR OPTION: Hide EVERYTHING that could be an overlay when recording */
+        .recording #camera-inactive-overlay,
+        .recording .absolute.inset-0,
+        .recording [id*="overlay"],
+        .recording [class*="overlay"] {
+            display: none !important;
+            visibility: hidden !important;
+            opacity: 0 !important;
+            pointer-events: none !important;
+            height: 0 !important;
+            width: 0 !important;
+            overflow: hidden !important;
+        }
+        /* Ensure video is always visible and on top when recording */
+        .recording #video {
+            z-index: 9999 !important;
+            position: relative !important;
+            display: block !important;
+            visibility: visible !important;
+            opacity: 1 !important;
+        }
+        /* Hide any div with "Camera Inactive" text when recording */
+        .recording div:has-text("Camera Inactive"),
+        .recording div:has-text("Click \"Start Recognition\"") {
+            display: none !important;
+        }
     </style>
 </head>
 <body class="bg-gray-50">
@@ -41,7 +70,9 @@
             currentPrediction: null,
             confidence: 0,
             ws: null,
-            videoStream: null
+            videoStream: null,
+            pendingLetter: null,  // Letter waiting for confirmation
+            pendingConfidence: 0
         };
 
         // API Helper
@@ -97,7 +128,7 @@
             }
         }
 
-        function logout() {
+        window.logout = function logout() {
             state.token = null;
             state.user = null;
             localStorage.removeItem('token');
@@ -107,59 +138,235 @@
         }
 
         // WebSocket Functions
-        async function startRecording() {
-            if (state.isRecording) return;
+        window.startRecording = async function startRecording() {
+            console.log('🎬 Start Recording button clicked');
+            
+            // Check if user is authenticated
+            if (!state.token) {
+                console.error('❌ No authentication token found');
+                alert('❌ Please login first!');
+                state.currentPage = 'login';
+                render();
+                return;
+            }
+            
+            if (state.isRecording) {
+                console.log('Already recording');
+                return;
+            }
 
             try {
+                console.log('🎥 Requesting camera access...');
+                
                 // Get video stream
                 state.videoStream = await navigator.mediaDevices.getUserMedia({ 
-                    video: { width: 640, height: 480 } 
+                    video: { 
+                        width: { ideal: 640 },
+                        height: { ideal: 480 },
+                        facingMode: 'user'
+                    } 
                 });
 
+                console.log('✅ Camera access granted');
+
+                // Set recording state
+                state.isRecording = true;
+                console.log('✅ State updated: isRecording =', state.isRecording);
+                
+                // NUCLEAR OPTION: Remove ALL overlays immediately
+                const removeAllOverlays = () => {
+                    // Remove by ID
+                    const overlay = document.getElementById('camera-inactive-overlay');
+                    if (overlay) overlay.remove();
+                    
+                    // Remove all absolute positioned divs in video container
+                    const container = document.getElementById('video-container');
+                    if (container) {
+                        Array.from(container.children).forEach(child => {
+                            if (child.tagName !== 'VIDEO' && 
+                                (child.classList.contains('absolute') || 
+                                 child.textContent?.includes('Camera Inactive') ||
+                                 child.textContent?.includes('Click "Start Recognition"'))) {
+                                console.log('🗑️ Removing overlay element:', child);
+                                child.remove();
+                            }
+                        });
+                    }
+                    
+                    // Force hide any remaining overlays
+                    document.querySelectorAll('.absolute.inset-0, [id*="overlay"]').forEach(el => {
+                        if (el.textContent?.includes('Camera Inactive')) {
+                            el.style.cssText = 'display: none !important; visibility: hidden !important; opacity: 0 !important;';
+                            el.remove();
+                        }
+                    });
+                };
+                
+                removeAllOverlays();
+                
+                // Re-render to update UI
+                render();
+                
+                // Remove again after render
+                setTimeout(removeAllOverlays, 10);
+                setTimeout(removeAllOverlays, 50);
+                setTimeout(removeAllOverlays, 100);
+
+                // Wait for DOM to update
+                await new Promise(resolve => setTimeout(resolve, 200));
+
+                // Get video element
                 const video = document.getElementById('video');
+                if (!video) {
+                    console.error('❌ Video element not found');
+                    throw new Error('Video element not found');
+                }
+
+                console.log('📹 Setting video source...');
                 video.srcObject = state.videoStream;
+                
+                // Wait for video to load
+                await new Promise((resolve, reject) => {
+                    video.onloadedmetadata = () => {
+                        console.log('📹 Video metadata loaded');
+                        video.play()
+                            .then(() => {
+                                console.log('✅ Video playing');
+                                resolve();
+                            })
+                            .catch(err => {
+                                console.error('❌ Video play error:', err);
+                                reject(err);
+                            });
+                    };
+                    
+                    // Timeout after 5 seconds
+                    setTimeout(() => reject(new Error('Video load timeout')), 5000);
+                });
+
+                // Aggressively remove overlay after video is playing
+                const removeOverlay = () => {
+                    // Remove by ID
+                    const overlay = document.getElementById('camera-inactive-overlay');
+                    if (overlay) {
+                        console.log('🗑️ Force removing camera inactive overlay by ID');
+                        overlay.remove();
+                    }
+                    
+                    // Remove any overlays with "Camera Inactive" text
+                    const allOverlays = document.querySelectorAll('.absolute.inset-0, [id*="overlay"], [class*="overlay"]');
+                    allOverlays.forEach(ov => {
+                        const text = ov.textContent || '';
+                        if (text.includes('Camera Inactive') || text.includes('Click "Start Recognition"')) {
+                            console.log('🗑️ Removing overlay by text content:', text.substring(0, 50));
+                            ov.style.display = 'none';
+                            ov.style.visibility = 'hidden';
+                            ov.remove();
+                        }
+                    });
+                    
+                    // Also check video container directly
+                    const container = document.getElementById('video-container');
+                    if (container) {
+                        const children = container.children;
+                        for (let child of children) {
+                            if (child.id === 'camera-inactive-overlay' || 
+                                (child.textContent && child.textContent.includes('Camera Inactive'))) {
+                                console.log('🗑️ Removing overlay from container');
+                                child.remove();
+                            }
+                        }
+                    }
+                };
+                
+                // Try multiple times to ensure removal
+                removeOverlay();
+                setTimeout(removeOverlay, 50);
+                setTimeout(removeOverlay, 100);
+                setTimeout(removeOverlay, 200);
+                setTimeout(removeOverlay, 500);
+                
+                // Set up a MutationObserver to catch any overlay that gets added back
+                const observer = new MutationObserver((mutations) => {
+                    if (state.isRecording) {
+                        removeOverlay();
+                    }
+                });
+                
+                const container = document.getElementById('video-container');
+                if (container) {
+                    observer.observe(container, { childList: true, subtree: true });
+                }
+
+                console.log('🔌 Connecting to WebSocket...');
 
                 // Connect WebSocket
                 state.ws = new WebSocket(`${WS_BASE}/ws/recognition`);
 
                 state.ws.onopen = () => {
+                    console.log('✅ WebSocket connected');
                     state.ws.send(JSON.stringify({
                         type: 'authenticate',
                         token: state.token
                     }));
+                    
+                    // Start sending frames
+                    setTimeout(() => {
+                        console.log('📸 Starting frame capture...');
+                        sendFrames();
+                    }, 500);
                 };
 
                 state.ws.onmessage = (event) => {
                     const data = JSON.parse(event.data);
+                    console.log('📨 Received:', data.type);
                     handleWSMessage(data);
                 };
 
                 state.ws.onerror = (error) => {
-                    console.error('WebSocket error:', error);
-                    alert('Connection error. Please try again.');
+                    console.error('❌ WebSocket error:', error);
+                    alert('Connection error. Make sure backend is running on port 8000');
+                    // Don't reset isRecording on error - let user manually stop
                 };
 
                 state.ws.onclose = () => {
-                    console.log('WebSocket closed');
-                    state.isRecording = false;
+                    console.log('🔌 WebSocket closed');
+                    // Only reset if it wasn't a manual stop
+                    if (state.isRecording) {
+                        state.isRecording = false;
+                        render();
+                    }
                 };
 
-                state.isRecording = true;
-
-                // Start sending frames
-                sendFrames();
             } catch (error) {
-                console.error('Error starting recording:', error);
-                alert('Could not access camera: ' + error.message);
+                console.error('❌ Error:', error);
+                state.isRecording = false;
+                
+                if (error.name === 'NotAllowedError') {
+                    alert('❌ Camera permission denied!\n\nPlease:\n1. Click the camera icon in address bar\n2. Allow camera access\n3. Refresh page and try again');
+                } else if (error.name === 'NotFoundError') {
+                    alert('❌ No camera found!\n\nPlease connect a camera and try again.');
+                } else {
+                    alert('❌ Error: ' + error.message);
+                }
+                
+                render();
             }
         }
 
         function sendFrames() {
             if (!state.isRecording || !state.ws || state.ws.readyState !== WebSocket.OPEN) {
+                console.log('⏸️ Stopping frame capture');
                 return;
             }
 
             const video = document.getElementById('video');
+            if (!video || !video.srcObject) {
+                console.log('⏸️ Video not ready');
+                setTimeout(sendFrames, 100);
+                return;
+            }
+
             const canvas = document.createElement('canvas');
             canvas.width = video.videoWidth;
             canvas.height = video.videoHeight;
@@ -180,7 +387,7 @@
             switch (data.type) {
                 case 'session_started':
                     state.currentSession = data.session_id;
-                    console.log('Session started:', data.session_id);
+                    console.log('✅ Session started:', data.session_id);
                     break;
 
                 case 'prediction':
@@ -189,31 +396,53 @@
                     updatePredictionDisplay();
                     break;
 
+                case 'letter_pending':
+                    // Letter detected, waiting for user confirmation
+                    state.pendingLetter = data.letter;
+                    state.pendingConfidence = data.confidence;
+                    console.log('⏳ Letter pending confirmation:', data.letter, `(${(data.confidence * 100).toFixed(1)}%)`);
+                    updatePendingLetterDisplay();
+                    break;
+
                 case 'letter_detected':
                     state.sentence = data.sentence;
+                    state.pendingLetter = null;  // Clear pending after acceptance
+                    console.log('✅ Letter accepted and added:', data.letter);
                     updateSentenceDisplay();
+                    updatePendingLetterDisplay();
+                    break;
+
+                case 'letter_rejected':
+                    state.pendingLetter = null;
+                    console.log('❌ Letter rejected');
+                    updatePendingLetterDisplay();
                     break;
 
                 case 'word_registered':
                     state.registeredWords = data.words;
+                    console.log('✅ Word registered');
                     updateWordsDisplay();
                     break;
 
                 case 'cleared':
                     state.sentence = '';
                     state.registeredWords = [];
+                    state.pendingLetter = null;
                     updateSentenceDisplay();
                     updateWordsDisplay();
+                    updatePendingLetterDisplay();
                     break;
 
                 case 'error':
-                    console.error('WebSocket error:', data.message);
+                    console.error('❌ Server error:', data.message);
                     alert('Error: ' + data.message);
                     break;
             }
         }
 
-        function stopRecording() {
+        window.stopRecording = function stopRecording() {
+            console.log('⏹️ Stopping recording');
+            
             if (state.ws) {
                 state.ws.send(JSON.stringify({ type: 'stop' }));
                 state.ws.close();
@@ -230,16 +459,39 @@
             state.confidence = 0;
         }
 
-        function registerWord() {
+        window.registerWord = function registerWord() {
+            console.log('📝 Registering word');
             if (state.ws && state.ws.readyState === WebSocket.OPEN) {
                 state.ws.send(JSON.stringify({ type: 'register_word' }));
+                console.log('✅ Register word command sent');
+            } else {
+                console.error('❌ WebSocket not ready. State:', state.ws ? state.ws.readyState : 'null');
+                // Fallback: update UI directly if WebSocket is not available
+                if (state.sentence.trim()) {
+                    state.registeredWords.push(state.sentence.trim());
+                    state.sentence = '';
+                    updateSentenceDisplay();
+                    updateWordsDisplay();
+                    console.log('✅ Word registered locally (fallback)');
+                }
             }
         }
 
-        function clearText() {
+        window.clearText = function clearText() {
+            console.log('🗑️ Clearing text');
             if (state.ws && state.ws.readyState === WebSocket.OPEN) {
                 state.ws.send(JSON.stringify({ type: 'clear' }));
+                console.log('✅ Clear command sent');
+            } else {
+                console.error('❌ WebSocket not ready. State:', state.ws ? state.ws.readyState : 'null');
             }
+            
+            // Always clear locally regardless of WebSocket state
+            state.sentence = '';
+            state.registeredWords = [];
+            updateSentenceDisplay();
+            updateWordsDisplay();
+            console.log('✅ Text cleared locally');
         }
 
         // UI Update Functions
@@ -259,6 +511,58 @@
             const wordsEl = document.getElementById('words');
             if (wordsEl) {
                 wordsEl.textContent = state.registeredWords.join(' • ') || 'No words registered yet';
+            }
+        }
+
+        function updatePendingLetterDisplay() {
+            const pendingEl = document.getElementById('pending-letter');
+            const pendingConfEl = document.getElementById('pending-confidence');
+            const pendingContainer = document.getElementById('pending-letter-container');
+            
+            if (state.pendingLetter) {
+                if (pendingEl) {
+                    pendingEl.textContent = state.pendingLetter;
+                }
+                if (pendingConfEl) {
+                    pendingConfEl.textContent = `Confidence: ${(state.pendingConfidence * 100).toFixed(1)}%`;
+                }
+                if (pendingContainer) {
+                    pendingContainer.style.display = 'block';
+                }
+            } else {
+                if (pendingEl) {
+                    pendingEl.textContent = '';
+                }
+                if (pendingConfEl) {
+                    pendingConfEl.textContent = '';
+                }
+                if (pendingContainer) {
+                    pendingContainer.style.display = 'none';
+                }
+            }
+        }
+
+        window.acceptLetter = function acceptLetter() {
+            console.log('✅ Accepting pending letter:', state.pendingLetter);
+            if (state.ws && state.ws.readyState === WebSocket.OPEN && state.pendingLetter) {
+                state.ws.send(JSON.stringify({ type: 'accept_letter' }));
+            } else if (state.pendingLetter) {
+                // Fallback: accept locally
+                state.sentence += state.pendingLetter;
+                state.pendingLetter = null;
+                updateSentenceDisplay();
+                updatePendingLetterDisplay();
+            }
+        }
+
+        window.rejectLetter = function rejectLetter() {
+            console.log('❌ Rejecting pending letter:', state.pendingLetter);
+            if (state.ws && state.ws.readyState === WebSocket.OPEN) {
+                state.ws.send(JSON.stringify({ type: 'reject_letter' }));
+            } else {
+                // Fallback: reject locally
+                state.pendingLetter = null;
+                updatePendingLetterDisplay();
             }
         }
 
@@ -375,32 +679,34 @@
                                 <div class="bg-white rounded-2xl shadow-xl p-6">
                                     <h2 class="text-2xl font-bold mb-4">Live Camera Feed</h2>
                                     
-                                    <div class="relative bg-black rounded-lg overflow-hidden ${state.isRecording ? 'recording' : ''}">
+                                    <div id="video-container" class="relative bg-black rounded-lg overflow-hidden ${state.isRecording ? 'recording' : ''}" style="min-height: 400px;">
                                         <video id="video" autoplay playsinline muted 
-                                            class="w-full h-auto"></video>
+                                            class="w-full h-auto" style="position: relative; z-index: 1000 !important; display: block !important;"></video>
                                         
                                         ${!state.isRecording ? `
-                                            <div class="absolute inset-0 flex items-center justify-center bg-black bg-opacity-50">
-                                                <p class="text-white text-xl">Camera inactive</p>
+                                        <div id="camera-inactive-overlay" class="absolute inset-0 flex items-center justify-center bg-black bg-opacity-70" style="z-index: 5;">
+                                            <div class="text-center">
+                                                <p class="text-white text-2xl mb-2">📷 Camera Inactive</p>
+                                                <p class="text-gray-300">Click "Start Recognition" below</p>
                                             </div>
+                                        </div>
                                         ` : ''}
                                         
-                                        <!-- ROI Overlay -->
-                                        <div class="absolute top-20 left-1/2 transform -translate-x-1/2 w-80 h-80 border-4 border-green-500 rounded-lg pointer-events-none"></div>
+                                        ${state.isRecording ? `
+                                            <!-- ROI Overlay -->
+                                            <div class="absolute top-1/4 left-1/2 transform -translate-x-1/2 w-80 h-80 border-4 border-green-500 rounded-lg pointer-events-none" style="z-index: 15;"></div>
+                                        ` : ''}
                                     </div>
 
                                     <div class="mt-6 flex gap-4">
-                                        ${!state.isRecording ? `
-                                            <button onclick="startRecording()"
-                                                class="flex-1 bg-green-600 text-white py-3 rounded-lg font-semibold hover:bg-green-700 transition shadow-lg">
-                                                🎥 Start Recognition
-                                            </button>
-                                        ` : `
-                                            <button onclick="stopRecording(); render();"
-                                                class="flex-1 bg-red-600 text-white py-3 rounded-lg font-semibold hover:bg-red-700 transition shadow-lg">
-                                                ⏹️ Stop Recognition
-                                            </button>
-                                        `}
+                                        <button onclick="startRecording(); console.log('Button clicked, startRecording called');" id="startBtn"
+                                            class="${state.isRecording ? 'hidden' : ''} flex-1 bg-green-600 text-white py-3 rounded-lg font-semibold hover:bg-green-700 transition shadow-lg">
+                                            🎥 Start Recognition
+                                        </button>
+                                        <button onclick="stopRecording(); render();" id="stopBtn"
+                                            class="${!state.isRecording ? 'hidden' : ''} flex-1 bg-red-600 text-white py-3 rounded-lg font-semibold hover:bg-red-700 transition shadow-lg">
+                                            ⏹️ Stop Recognition
+                                        </button>
                                     </div>
                                 </div>
 
@@ -418,6 +724,26 @@
                                         </div>
                                     </div>
                                 </div>
+
+                                <!-- Pending Letter Confirmation -->
+                                <div id="pending-letter-container" class="mt-6 bg-yellow-50 border-2 border-yellow-400 rounded-2xl shadow-xl p-6" style="display: none;">
+                                    <h3 class="text-xl font-bold mb-4 text-yellow-800">⏳ Letter Detected - Confirm?</h3>
+                                    <div class="text-center mb-4">
+                                        <p class="text-sm text-gray-600 mb-2">Pending Letter:</p>
+                                        <p id="pending-letter" class="text-5xl font-bold text-yellow-700 mb-2"></p>
+                                        <p id="pending-confidence" class="text-lg text-gray-600"></p>
+                                    </div>
+                                    <div class="flex gap-3 mt-4">
+                                        <button id="accept-letter-btn" onclick="acceptLetter(); return false;"
+                                            class="flex-1 bg-green-600 text-white py-3 rounded-lg font-semibold hover:bg-green-700 transition cursor-pointer">
+                                            ✓ Accept
+                                        </button>
+                                        <button id="reject-letter-btn" onclick="rejectLetter(); return false;"
+                                            class="flex-1 bg-red-600 text-white py-3 rounded-lg font-semibold hover:bg-red-700 transition cursor-pointer">
+                                            ✗ Reject
+                                        </button>
+                                    </div>
+                                </div>
                             </div>
 
                             <!-- Output Section -->
@@ -430,12 +756,12 @@
                                     </div>
                                     
                                     <div class="mt-4 flex gap-2">
-                                        <button onclick="registerWord()"
-                                            class="flex-1 bg-blue-600 text-white py-2 rounded-lg font-semibold hover:bg-blue-700 transition">
+                                        <button id="register-word-btn" onclick="registerWord(); return false;"
+                                            class="flex-1 bg-blue-600 text-white py-2 rounded-lg font-semibold hover:bg-blue-700 transition cursor-pointer">
                                             ✓ Register Word
                                         </button>
-                                        <button onclick="clearText()"
-                                            class="bg-red-600 text-white px-4 py-2 rounded-lg font-semibold hover:bg-red-700 transition">
+                                        <button id="clear-text-btn" onclick="clearText(); return false;"
+                                            class="bg-red-600 text-white px-4 py-2 rounded-lg font-semibold hover:bg-red-700 transition cursor-pointer">
                                             Clear
                                         </button>
                                     </div>
@@ -468,13 +794,13 @@
         }
 
         // Event Handlers
-        function handleLogin() {
+        window.handleLogin = function handleLogin() {
             const username = document.getElementById('login-username').value;
             const password = document.getElementById('login-password').value;
             login(username, password);
         }
 
-        function handleRegister() {
+        window.handleRegister = function handleRegister() {
             const username = document.getElementById('reg-username').value;
             const email = document.getElementById('reg-email').value;
             const password = document.getElementById('reg-password').value;
@@ -502,18 +828,142 @@
             
             app.innerHTML = content;
 
-            // If on recognition page and video exists, maintain stream
-            if (state.currentPage === 'recognition' && state.videoStream) {
+            // If on recognition page and video stream exists, reattach it
+            if (state.currentPage === 'recognition' && state.isRecording && state.videoStream) {
                 setTimeout(() => {
                     const video = document.getElementById('video');
-                    if (video && state.videoStream) {
-                        video.srcObject = state.videoStream;
+                    if (video) {
+                        if (!video.srcObject) {
+                            video.srcObject = state.videoStream;
+                        }
+                        video.play().catch(err => console.error('Video play error:', err));
+                        
+                        // Aggressively remove overlay if recording
+                        if (state.isRecording) {
+                            const overlay = document.getElementById('camera-inactive-overlay');
+                            if (overlay) {
+                                console.log('🔧 Removing overlay in video reattach');
+                                overlay.remove();
+                            }
+                            
+                            // Remove all overlays that might match
+                            const allOverlays = document.querySelectorAll('#camera-inactive-overlay, .absolute.inset-0.flex.items-center.justify-center');
+                            allOverlays.forEach(ov => {
+                                if (ov.textContent && ov.textContent.includes('Camera Inactive')) {
+                                    console.log('🔧 Removing overlay by text content');
+                                    ov.remove();
+                                }
+                            });
+                        }
                     }
                 }, 100);
+            }
+            
+            // Re-attach event listeners for buttons after render
+            if (state.currentPage === 'recognition') {
+                setTimeout(() => {
+                    // NUCLEAR OPTION: If recording, remove ALL overlays aggressively
+                    if (state.isRecording) {
+                        console.log('🔧 NUCLEAR: Removing all overlays (isRecording=true)');
+                        
+                        // Remove by ID
+                        const overlay = document.getElementById('camera-inactive-overlay');
+                        if (overlay) {
+                            overlay.remove();
+                            console.log('✅ Removed overlay by ID');
+                        }
+                        
+                        // Remove from video container
+                        const container = document.getElementById('video-container');
+                        if (container) {
+                            Array.from(container.children).forEach(child => {
+                                if (child.tagName !== 'VIDEO') {
+                                    const text = child.textContent || '';
+                                    if (text.includes('Camera Inactive') || 
+                                        text.includes('Click "Start Recognition"') ||
+                                        (child.classList.contains('absolute') && child.classList.contains('inset-0'))) {
+                                        console.log('✅ Removing overlay child:', child.tagName);
+                                        child.remove();
+                                    }
+                                }
+                            });
+                        }
+                        
+                        // Force CSS hide on any remaining
+                        document.querySelectorAll('#video-container > *').forEach(el => {
+                            if (el.tagName !== 'VIDEO') {
+                                el.style.cssText = 'display: none !important; visibility: hidden !important; opacity: 0 !important; position: absolute !important; left: -9999px !important;';
+                            }
+                        });
+                    }
+                    
+                    const startBtn = document.getElementById('startBtn');
+                    const stopBtn = document.getElementById('stopBtn');
+                    const registerBtn = document.getElementById('register-word-btn');
+                    const clearBtn = document.getElementById('clear-text-btn');
+                    const acceptBtn = document.getElementById('accept-letter-btn');
+                    const rejectBtn = document.getElementById('reject-letter-btn');
+                    
+                    if (startBtn) {
+                        startBtn.onclick = function(e) {
+                            e.preventDefault();
+                            console.log('Start button clicked via event listener');
+                            startRecording();
+                        };
+                    }
+                    
+                    if (stopBtn) {
+                        stopBtn.onclick = function(e) {
+                            e.preventDefault();
+                            stopRecording();
+                            render();
+                        };
+                    }
+                    
+                    // Re-attach register and clear button handlers
+                    if (registerBtn) {
+                        registerBtn.onclick = function(e) {
+                            e.preventDefault();
+                            e.stopPropagation();
+                            console.log('Register button clicked via event listener');
+                            registerWord();
+                        };
+                    }
+                    
+                    if (clearBtn) {
+                        clearBtn.onclick = function(e) {
+                            e.preventDefault();
+                            e.stopPropagation();
+                            console.log('Clear button clicked via event listener');
+                            clearText();
+                        };
+                    }
+                    
+                    // Re-attach accept/reject button handlers
+                    if (acceptBtn) {
+                        acceptBtn.onclick = function(e) {
+                            e.preventDefault();
+                            e.stopPropagation();
+                            console.log('Accept button clicked via event listener');
+                            acceptLetter();
+                        };
+                    }
+                    
+                    if (rejectBtn) {
+                        rejectBtn.onclick = function(e) {
+                            e.preventDefault();
+                            e.stopPropagation();
+                            console.log('Reject button clicked via event listener');
+                            rejectLetter();
+                        };
+                    }
+                }, 50);
             }
         }
 
         // Initialize
+        console.log('🚀 Application starting...');
+        
         if (state.token) {
             apiCall('/api/auth/me')
                 .then(user => {
@@ -534,6 +984,135 @@
         window.addEventListener('beforeunload', () => {
             stopRecording();
         });
+
+        // Test function - run in console
+        window.testCamera = async function() {
+            console.log('🧪 Testing camera...');
+            try {
+                const stream = await navigator.mediaDevices.getUserMedia({ video: true });
+                console.log('✅ Camera works!');
+                stream.getTracks().forEach(track => track.stop());
+            } catch (err) {
+                console.error('❌ Camera error:', err);
+            }
+        };
+        
+        // Debug function to manually remove overlay
+        window.removeOverlay = function() {
+            console.log('🔧 Manually removing overlay...');
+            console.log('Current isRecording state:', typeof state !== 'undefined' ? state.isRecording : 'state not found');
+            
+            // Method 1: Remove by ID
+            const overlay = document.getElementById('camera-inactive-overlay');
+            if (overlay) {
+                console.log('✅ Found overlay by ID, removing...');
+                overlay.style.display = 'none';
+                overlay.style.visibility = 'hidden';
+                overlay.remove();
+                console.log('✅ Overlay removed by ID');
+            } else {
+                console.log('❌ Overlay not found by ID');
+            }
+            
+            // Method 2: Find by class and position
+            const videoContainer = document.getElementById('video-container');
+            if (videoContainer) {
+                console.log('✅ Found video-container');
+                const children = Array.from(videoContainer.children);
+                children.forEach((child, index) => {
+                    console.log(`Child ${index}:`, child.tagName, child.id, child.className);
+                    if (child.id === 'camera-inactive-overlay' || 
+                        (child.classList.contains('absolute') && child.classList.contains('inset-0'))) {
+                        console.log('✅ Found overlay by class, removing...');
+                        child.remove();
+                    }
+                });
+            }
+            
+            // Method 3: Remove all absolute positioned overlays in video container
+            const allAbsolute = document.querySelectorAll('#video-container .absolute.inset-0');
+            allAbsolute.forEach(el => {
+                if (el.id === 'camera-inactive-overlay' || el.textContent.includes('Camera Inactive') || el.textContent.includes('Click "Start Recognition"')) {
+                    console.log('✅ Removing overlay found by selector');
+                    el.remove();
+                }
+            });
+            
+            // Method 4: Hide all overlays with z-index 2 or 5
+            const allOverlays = document.querySelectorAll('.absolute');
+            allOverlays.forEach(el => {
+                const zIndex = window.getComputedStyle(el).zIndex;
+                if ((zIndex === '2' || zIndex === '5') && el.id !== 'video') {
+                    const text = el.textContent || '';
+                    if (text.includes('Camera Inactive') || text.includes('Click "Start Recognition"')) {
+                        console.log('✅ Removing overlay by z-index and text');
+                        el.remove();
+                    }
+                }
+            });
+            
+            console.log('✅ Overlay removal complete');
+        };
+        
+        // Also add a function to inspect the DOM
+        window.inspectOverlay = function() {
+            console.log('🔍 Inspecting overlay...');
+            const container = document.getElementById('video-container');
+            if (container) {
+                console.log('Video container found:', container);
+                console.log('Children:', Array.from(container.children).map(c => ({
+                    tag: c.tagName,
+                    id: c.id,
+                    classes: c.className,
+                    text: c.textContent?.substring(0, 50)
+                })));
+            } else {
+                console.log('❌ video-container not found');
+            }
+            
+            const overlay = document.getElementById('camera-inactive-overlay');
+            if (overlay) {
+                console.log('Overlay found:', overlay);
+                console.log('Overlay styles:', window.getComputedStyle(overlay).display);
+            } else {
+                console.log('❌ camera-inactive-overlay not found by ID');
+            }
+        };
+
+        console.log('✅ Application ready!');
+        console.log('💡 Tip: Open console (F12) to see detailed logs');
+        console.log('🧪 Tip: Run testCamera() in console to test camera access');
+        console.log('🔧 Tip: If overlay persists, run removeOverlay() in console to manually remove it');
+        
+        // Make sure removeOverlay is accessible
+        if (typeof window.removeOverlay === 'function') {
+            console.log('✅ removeOverlay function is available');
+        } else {
+            console.error('❌ removeOverlay function not found - defining it now');
+            window.removeOverlay = function() {
+                console.log('🔧 Manually removing overlay...');
+                const overlay = document.getElementById('camera-inactive-overlay');
+                if (overlay) {
+                    overlay.remove();
+                    console.log('✅ Overlay removed by ID');
+                }
+                
+                const allElements = document.querySelectorAll('*');
+                let removed = 0;
+                allElements.forEach(el => {
+                    if (el.textContent && el.textContent.includes('Camera Inactive') && 
+                        el.id !== 'video' && el.tagName !== 'VIDEO' && el.id !== 'app') {
+                        el.remove();
+                        removed++;
+                    }
+                });
+                console.log(`✅ Removed ${removed} elements with "Camera Inactive" text`);
+                if (typeof state !== 'undefined') {
+                    console.log('Current isRecording state:', state.isRecording);
+                }
+            };
+            console.log('✅ removeOverlay function defined');
+        }
     </script>
 </body>
 </html>
