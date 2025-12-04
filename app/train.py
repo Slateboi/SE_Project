@@ -24,15 +24,15 @@ LABEL_MAP_OUT = "app/label_map.json"
 
 IMG_H, IMG_W = 64, 64
 BATCH = 64
-EPOCHS = 15           # can increase to 25+ later
+EPOCHS = 25           # Increased from 15 to 25 for better training
 LR = 1e-4
 AUGMENT = True
 # ----------------------------------------
 
 # ---------------- helper ----------------
 def load_data():
-    X_train = np.load(os.path.join(DATA_DIR, "X_train.npy"))
-    X_test  = np.load(os.path.join(DATA_DIR, "X_test.npy"))
+    X_train = np.load(os.path.join(DATA_DIR, "x_train.npy"))
+    X_test  = np.load(os.path.join(DATA_DIR, "x_test.npy"))
     y_train = np.load(os.path.join(DATA_DIR, "y_train.npy"))
     y_test  = np.load(os.path.join(DATA_DIR, "y_test.npy"))
     label_map = np.load(os.path.join(DATA_DIR, "label_dict.npy"), allow_pickle=True).item()
@@ -43,12 +43,19 @@ def load_data():
 
 def get_model(input_shape, num_classes):
     base = MobileNetV2(include_top=False, weights="imagenet", input_shape=input_shape)
-    base.trainable = False  # freeze pretrained layers for faster training
-
+    
+    # Unfreeze the last few layers for fine-tuning
+    base.trainable = True
+    # Freeze all layers except the last 30
+    for layer in base.layers[:-30]:
+        layer.trainable = False
+    
     x = base.output
     x = GlobalAveragePooling2D()(x)
-    x = Dense(256, activation="relu")(x)
+    x = Dense(512, activation="relu")(x)  # Increased from 256 to 512
     x = Dropout(0.5)(x)
+    x = Dense(256, activation="relu")(x)  # Added another dense layer
+    x = Dropout(0.3)(x)
     outputs = Dense(num_classes, activation="softmax")(x)
 
     model = Model(inputs=base.input, outputs=outputs)
@@ -114,14 +121,15 @@ def main():
         )
 
     # Save model & label map
-    if not os.path.exists(MODEL_OUT):
-        model.save(MODEL_OUT)
+    model.save(MODEL_OUT)
     print("✅ Model training complete! Saved to:", MODEL_OUT)
 
+    # Create inverse label map: {index: label} for inference
     inv_label_map = {str(idx): label for label, idx in label_map.items()}
     with open(LABEL_MAP_OUT, "w") as f:
         json.dump(inv_label_map, f, indent=2)
     print("📁 Saved label map to:", LABEL_MAP_OUT)
+    print(f"   Label map contains {len(inv_label_map)} classes: {list(label_map.keys())}")
 
 if __name__ == "__main__":
     main()

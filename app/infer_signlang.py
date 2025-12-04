@@ -39,25 +39,56 @@ print("🔹 Loading model...")
 model = tf.keras.models.load_model(MODEL_PATH)
 print("✅ Model loaded.")
 
-# Load label map and build idx->label robustly
-with open(LABEL_MAP_PATH, "r") as f:
-    label_map = json.load(f)
-
+# Load label map and build idx->label robustly, with fallbacks
 def build_idx_to_label(mapping):
+    """Return a dict mapping integer index -> label string for various mapping shapes."""
+    if mapping is None:
+        return {}
+    # If values are ints: {'A':0, 'B':1} -> invert
     if all(isinstance(v, int) for v in mapping.values()):
         return {v: k for k, v in mapping.items()}
+    # If keys are numeric strings: {'0':'A','1':'B'}
     try:
-        if all(k.isdigit() for k in mapping.keys()):
+        if all(str(k).isdigit() for k in mapping.keys()):
             return {int(k): v for k, v in mapping.items()}
     except Exception:
         pass
+    # If values are numeric strings: {'A':'0','B':'1'}
     try:
         return {int(v): k for k, v in mapping.items()}
     except Exception:
-        return {int(k): v for k, v in mapping.items()}
+        # Fallback: try numeric-convertible keys
+        return {int(k): v for k, v in mapping.items() if str(k).isdigit()}
+
+
+# Try multiple sources to get a label map that matches model output dim
+model_num_classes = int(model.output_shape[-1]) if model.output_shape else None
+label_map = None
+loaded_from = None
+
+# 1) Try the JSON label map if present
+try:
+    with open(LABEL_MAP_PATH, "r") as f:
+        label_map = json.load(f)
+        loaded_from = LABEL_MAP_PATH
+except Exception:
+    label_map = None
 
 idx_to_label = build_idx_to_label(label_map)
-print("Labels loaded. Classes:", len(idx_to_label))
+
+# If JSON didn't match model classes, try dataset label_dict.npy
+if model_num_classes is not None and len(idx_to_label) != model_num_classes:
+    try:
+        np_path = "dataset/label_dict.npy"
+        ld = np.load(np_path, allow_pickle=True).item()
+        idx_to_label = build_idx_to_label(ld)
+        loaded_from = np_path
+    except Exception:
+        # Last fallback: create generic labels 0..N-1
+        if model_num_classes is not None:
+            idx_to_label = {i: str(i) for i in range(model_num_classes)}
+
+print(f"Labels loaded from: {loaded_from or 'generated'}, Classes: {len(idx_to_label)}")
 
 # Model input info
 model_input_shape = model.input_shape

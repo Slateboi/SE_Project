@@ -158,6 +158,11 @@
             try {
                 console.log('🎥 Requesting camera access...');
                 
+                // Check if getUserMedia is supported
+                if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+                    throw new Error('Camera access is not supported in this browser. Please use Chrome, Firefox, or Edge, and ensure the page is served over HTTPS or localhost.');
+                }
+                
                 // Get video stream
                 state.videoStream = await navigator.mediaDevices.getUserMedia({ 
                     video: { 
@@ -572,7 +577,7 @@
                 <div class="min-h-screen gradient-bg flex items-center justify-center p-4">
                     <div class="bg-white rounded-2xl shadow-2xl w-full max-w-md p-8">
                         <div class="text-center mb-8">
-                            <h1 class="text-4xl font-bold text-gray-800 mb-2">ASL Recognition</h1>
+                            <h1 class="text-4xl font-bold text-gray-800 mb-2">GestureNet</h1>
                             <p class="text-gray-600">Sign language to text converter</p>
                         </div>
 
@@ -661,7 +666,7 @@
                     <!-- Header -->
                     <header class="gradient-bg shadow-lg">
                         <div class="max-w-7xl mx-auto px-4 py-4 flex justify-between items-center">
-                            <h1 class="text-2xl font-bold text-white">ASL Recognition</h1>
+                            <h1 class="text-2xl font-bold text-white">GestureNet</h1>
                             <div class="flex items-center gap-4">
                                 <span class="text-white">Welcome, ${state.user?.username || 'User'}</span>
                                 <button onclick="logout()" 
@@ -989,6 +994,12 @@
         window.testCamera = async function() {
             console.log('🧪 Testing camera...');
             try {
+                // Check if getUserMedia is supported
+                if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+                    console.error('❌ getUserMedia not supported');
+                    return;
+                }
+                
                 const stream = await navigator.mediaDevices.getUserMedia({ video: true });
                 console.log('✅ Camera works!');
                 stream.getTracks().forEach(track => track.stop());

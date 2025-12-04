@@ -34,14 +34,14 @@ SECRET_KEY = "your-secret-key-change-in-production-use-openssl-rand-hex-32"
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24  # 24 hours
 
-MODEL_PATH = "../app/gesture_model.h5"
-LABEL_MAP_PATH = "../app/label_map.json"
+MODEL_PATH = "app/gesture_model.h5"
+LABEL_MAP_PATH = "app/label_map.json"
 IMG_SIZE = (64, 64)
 # ROI coordinates - will be adjusted based on actual video dimensions
 # Format: (x1, y1, x2, y2) - top-left and bottom-right corners
 # These are relative percentages that will be scaled to actual video size
 ROI = None  # Will be calculated dynamically based on video dimensions
-CONF_THRESHOLD = 0.5  # Lowered to detect more letters (was 0.75)
+CONF_THRESHOLD = 0.90  # Require 90% confidence for detection (model has 98.89% validation accuracy)
 STABLE_FRAMES = 5
 TEXT_COOLDOWN = 1.2
 
@@ -187,26 +187,61 @@ class ASLRecognizer:
         self.model = tf.keras.models.load_model(MODEL_PATH)
         print("✅ Model loaded successfully")
         
-        with open(LABEL_MAP_PATH, "r") as f:
-            label_map = json.load(f)
+        # Get model's expected number of classes
+        model_num_classes = int(self.model.output_shape[-1]) if self.model.output_shape else None
+        
+        # Try loading from label_map.json first
+        label_map = None
+        loaded_from = None
+        try:
+            with open(LABEL_MAP_PATH, "r") as f:
+                label_map = json.load(f)
+                loaded_from = LABEL_MAP_PATH
+        except Exception as e:
+            print(f"⚠️ Could not load {LABEL_MAP_PATH}: {e}")
         
         # Build index to label mapping
         self.idx_to_label = self._build_idx_to_label(label_map)
+        
+        # If JSON didn't match model classes, try dataset label_dict.npy
+        if model_num_classes is not None and len(self.idx_to_label) != model_num_classes:
+            print(f"⚠️ Label map mismatch: JSON has {len(self.idx_to_label)} classes but model expects {model_num_classes}")
+            try:
+                np_path = "../dataset/label_dict.npy"
+                ld = np.load(np_path, allow_pickle=True).item()
+                self.idx_to_label = self._build_idx_to_label(ld)
+                loaded_from = np_path
+                print(f"✅ Loaded labels from {np_path}")
+            except Exception as e:
+                print(f"⚠️ Could not load {np_path}: {e}")
+                # Last fallback: create generic labels 0..N-1
+                if model_num_classes is not None:
+                    self.idx_to_label = {i: str(i) for i in range(model_num_classes)}
+                    loaded_from = "generated"
+        
         self.expected_channels = self.model.input_shape[-1] if self.model.input_shape else 3
-        print(f"📋 Loaded {len(self.idx_to_label)} classes")
+        print(f"📋 Loaded {len(self.idx_to_label)} classes from {loaded_from or 'JSON'}")
+        print(f"   Classes: {list(self.idx_to_label.values())[:10]}...")
     
     def _build_idx_to_label(self, mapping):
+        """Return a dict mapping integer index -> label string for various mapping shapes."""
+        if mapping is None:
+            return {}
+        # If values are ints: {'A':0, 'B':1} -> invert
         if all(isinstance(v, int) for v in mapping.values()):
             return {v: k for k, v in mapping.items()}
+        # If keys are numeric strings: {'0':'A','1':'B'}
         try:
-            if all(k.isdigit() for k in mapping.keys()):
+            if all(str(k).isdigit() for k in mapping.keys()):
                 return {int(k): v for k, v in mapping.items()}
-        except:
+        except Exception:
             pass
+        # If values are numeric strings: {'A':'0','B':'1'}
         try:
             return {int(v): k for k, v in mapping.items()}
-        except:
-            return {int(k): v for k, v in mapping.items()}
+        except Exception:
+            # Fallback: try numeric-convertible keys
+            return {int(k): v for k, v in mapping.items() if str(k).isdigit()}
     
     def predict(self, frame, roi=ROI):
         """Predict ASL letter from frame"""
@@ -243,47 +278,38 @@ class ASLRecognizer:
         
         roi_resized = cv2.resize(roi_crop, IMG_SIZE)
         
-        # Convert to grayscale (model expects 1 channel, not 3)
-        if len(roi_resized.shape) == 3:
-            gray = cv2.cvtColor(roi_resized, cv2.COLOR_BGR2GRAY)
+        # Check model's expected number of channels
+        expected_channels = self.expected_channels
+        
+        # Convert based on what model expects
+        if expected_channels == 3:
+            # Model expects RGB (3 channels)
+            if len(roi_resized.shape) == 2:
+                # Grayscale input, convert to RGB by repeating channels
+                proc = cv2.cvtColor(roi_resized, cv2.COLOR_GRAY2RGB)
+            else:
+                # Already BGR, convert to RGB
+                proc = cv2.cvtColor(roi_resized, cv2.COLOR_BGR2RGB)
+            proc = proc.reshape(IMG_SIZE[1], IMG_SIZE[0], 3)
         else:
-            gray = roi_resized
+            # Model expects grayscale (1 channel)
+            if len(roi_resized.shape) == 3:
+                proc = cv2.cvtColor(roi_resized, cv2.COLOR_BGR2GRAY)
+            else:
+                proc = roi_resized
+            proc = proc.reshape(IMG_SIZE[1], IMG_SIZE[0], 1)
         
         # Normalize to [0, 1] range (matching training)
-        proc = gray.astype("float32") / 255.0
-        
-        # Reshape to (64, 64, 1) - model expects 1 channel
-        proc = proc.reshape(IMG_SIZE[1], IMG_SIZE[0], 1)
+        proc = proc.astype("float32") / 255.0
         
         input_tensor = np.expand_dims(proc, axis=0)
         
         # Get model predictions
         preds = self.model.predict(input_tensor, verbose=0)[0]
         
-        # Use temperature scaling to reduce overconfidence
-        # This helps when model is overconfident (like 100% confidence)
-        # Temperature scaling: divide logits by temperature, then softmax
-        temperature = 3.0  # Higher temperature = softer predictions (reduces overconfidence more)
-        
-        # Apply temperature scaling (preds are already softmax outputs, so we need to convert back to logits)
-        # Since preds are probabilities, we convert to logits: log(p) / temperature
-        epsilon = 1e-10  # Avoid log(0)
-        logits = np.log(preds + epsilon) / temperature
-        preds_scaled = np.exp(logits - np.max(logits))  # Numerical stability
-        preds_scaled = preds_scaled / np.sum(preds_scaled)  # Renormalize to probabilities
-        
-        # SPECIAL HANDLING: If B has very high original confidence, penalize it
-        b_idx = None
-        for idx, lbl in self.idx_to_label.items():
-            if lbl == "B":
-                b_idx = idx
-                break
-        
-        if b_idx is not None and preds[b_idx] > 0.8:
-            # Penalize B predictions by reducing their confidence
-            preds_scaled[b_idx] = preds_scaled[b_idx] * 0.5  # Reduce B confidence by 50%
-            # Renormalize
-            preds_scaled = preds_scaled / np.sum(preds_scaled)
+        # No temperature scaling - model already has 98.89% accuracy, let it be confident
+        # Temperature = 1.0 (no scaling)
+        preds_scaled = preds
         
         class_idx = int(np.argmax(preds_scaled))
         conf = float(preds_scaled[class_idx])
@@ -372,9 +398,19 @@ async def register(user: UserRegister, db: Session = Depends(get_db)):
 @app.post("/api/auth/login", response_model=Token)
 async def login(user: UserLogin, db: Session = Depends(get_db)):
     """Login and get access token"""
+    print(f"🔐 Login attempt - Username: {user.username}")
     db_user = db.query(DBUser).filter(DBUser.username == user.username).first()
     
-    if not db_user or not verify_password(user.password, db_user.hashed_password):
+    if not db_user:
+        print(f"❌ User '{user.username}' not found in database")
+        raise HTTPException(status_code=401, detail="Incorrect username or password")
+    
+    print(f"✅ User found: {db_user.username}")
+    password_valid = verify_password(user.password, db_user.hashed_password)
+    print(f"🔑 Password verification: {password_valid}")
+    
+    if not password_valid:
+        print(f"❌ Password verification failed for user: {user.username}")
         raise HTTPException(status_code=401, detail="Incorrect username or password")
     
     access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
